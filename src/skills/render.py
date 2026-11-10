@@ -332,6 +332,18 @@ def _installable_skill_names() -> frozenset[str]:
 
 
 @lru_cache(maxsize=1)
+def _canonical_names_by_label() -> dict[str, str]:
+    """Each installed skill's display label, mapped back to its canonical catalog name."""
+    return {omh_skill_display_name(name): name for name in _installable_skill_names()}
+
+
+@lru_cache(maxsize=1)
+def _skill_labels_by_name() -> dict[str, str]:
+    """Each installed skill's canonical catalog name, mapped to its display label."""
+    return {name: omh_skill_display_name(name) for name in _installable_skill_names()}
+
+
+@lru_cache(maxsize=1)
 def _portable_skill_labels() -> frozenset[str]:
     """The labels the Agent Skills projection ships."""
     from .catalog_portable import portable_skill_names
@@ -440,55 +452,59 @@ def translate_sibling_mentions(text: str, *, owner: str = "", path: str = "") ->
     lines crediting an upstream project, the skill's own name and the router's
     registries stay canonical.
     """
-    installed = _installable_skill_names()
-    canonical_by_label = {omh_skill_display_name(name): name for name in installed}
-    owner = canonical_by_label.get(owner, owner)
+    labels = _skill_labels_by_name()
+    owner = _canonical_names_by_label().get(owner, owner)
     if owner in _CANONICAL_NAME_OWNERS and (not path or path in _ROUTER_CANONICAL_REFERENCES or path == "SKILL.md"):
         return text
     out: list[str] = []
     fenced = False
     for line in text.split("\n"):
-        stripped = line.strip()
-        if stripped.startswith("```"):
-            fenced = not fenced
-            out.append(line)
-        elif fenced or stripped.lower().startswith(_CANONICAL_LINE_PREFIXES) or _UPSTREAM_ATTRIBUTION.search(line):
-            out.append(line)
-        else:
-            out.append(_translate_line(line, installed, owner))
+        # A fence marker and a sibling mention both need a backtick.
+        if "`" in line:
+            stripped = line.strip()
+            if stripped.startswith("```"):
+                fenced = not fenced
+            elif not (
+                fenced
+                or stripped.lower().startswith(_CANONICAL_LINE_PREFIXES)
+                or ("@" in line and _UPSTREAM_ATTRIBUTION.search(line))
+            ):
+                line = _translate_line(line, labels, owner)
+        out.append(line)
     return "\n".join(out)
 
 
-def _translate_line(line: str, installed: frozenset[str], owner: str) -> str:
+def _translate_line(line: str, labels: dict[str, str], owner: str) -> str:
     pieces: list[str] = []
     cursor = 0
     previous_rewrote_end = -1
     for match in _BACKTICKED_SKILL_NAME.finditer(line):
         name = match.group(1)
-        pieces.append(line[cursor : match.start()])
-        cursor = match.end()
-        rewrite = (
-            name in installed
-            and (name != owner or owner in _CANONICAL_NAME_OWNERS)
-            and omh_skill_display_name(name) != name
-        )
+        label = name
+        if name in labels and (name != owner or owner in _CANONICAL_NAME_OWNERS):
+            label = labels[name]
+        rewrite = label != name
         if rewrite and "-" not in name:
-            before = line[: match.start()]
+            # The cheap evidence first; the hand-off-before search scans the whole prefix.
             after = _WORD.match(line[match.end() :].lstrip())
             chained = previous_rewrote_end >= 0 and bool(
                 _CHAIN_SEPARATOR.fullmatch(line[previous_rewrote_end : match.start()])
             )
             rewrite = (
-                _HANDOFF_BEFORE.search(before) is not None
+                chained
                 or (after is not None and after.group(0).lower() in _HANDOFF_WORDS_AFTER)
-                or chained
+                or _HANDOFF_BEFORE.search(line[: match.start()]) is not None
             )
         if rewrite:
-            pieces.append(f"`{omh_skill_display_name(name)}`")
+            # Only the name changes; the text around it is copied through.
+            pieces.append(line[cursor : match.start(1)])
+            pieces.append(label)
+            cursor = match.end(1)
             previous_rewrote_end = match.end()
         else:
-            pieces.append(match.group(0))
             previous_rewrote_end = -1
+    if not pieces:
+        return line
     pieces.append(line[cursor:])
     return "".join(pieces)
 
